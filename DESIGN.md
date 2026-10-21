@@ -21,7 +21,16 @@ Instead, the API enqueues a job and returns immediately. Celery workers process 
 - Celery's built-in `rate_limit` is per worker instance, not global. Three workers each set to 200/min could send 600/min together. So I build a shared Redis rate limiter that all workers consult (Section 4).
 - Redis as a broker is not durable by default. A Redis crash can lose queued jobs unless AOF persistence (`appendonly yes`) is enabled.
 - With `acks_late=True`, a redelivered task can run twice, so an email could be sent twice. Tasks need an idempotency key. On a Redis broker, an unacknowledged message from a killed worker is redelivered only after `visibility_timeout` (default 1 hour), which must be tuned (Section 5).
-### 2.2 Django Q
+### 2.2 Django Q / Django Q2
+**Pros**
+- Simpler infrastructure with the ORM broker: Django Q2 can use Django's database as its task broker, so a separate Redis service is not required. This reduces setup and operational overhead for smaller applications.
+- Retry controls: Django Q2 provides `retry` and `max_attempts`. Note that `retry` is how long the broker waits before presenting an unacknowledged task again; it is not exponential backoff for provider errors.
+- Multiple broker options: besides the Django ORM it supports Redis and other brokers, so the choice can follow the infrastructure.
+
+**Cons**
+- Database contention: with the ORM broker, workers poll and lock task rows in the same database as application queries (unless a separate database is configured), and every task state change is a database write. A burst of 2,000 jobs adds database load while the provider can only accept 200 emails per minute.
+- Rate limiting still needs custom work: the documented retry settings do not enforce a global 200/min limit across workers. A shared rate limiter would still be needed, and any backoff mechanism would have to be verified against the selected Django Q2 version.
+- Maintenance: the original `django-q` project's development stalled, and Django Q2 is a separate fork. Its current maintenance, supported versions, security fixes and release activity should be checked before adopting it.
 ### 2.3 Custom implementation
 ## 3. Decision
 ## 4. Rate limiter
