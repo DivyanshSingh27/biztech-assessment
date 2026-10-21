@@ -139,3 +139,14 @@ CELERY_RESULT_BACKEND = REDIS_URL
 # --- Email rate limit (provider allows 200 emails per minute) ---
 EMAIL_RATE_LIMIT = 200
 EMAIL_RATE_WINDOW_SECONDS = 60
+
+# --- Celery reliability ---
+# Redis broker re-delivers an unacknowledged message after this many seconds.
+# Must stay above the longest countdown used by the tasks (about 65s).
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    "visibility_timeout": int(os.environ.get("CELERY_VISIBILITY_TIMEOUT", "120")),
+}
+# Reserve one message per worker process so a killed worker holds back as few
+# unacknowledged jobs as possible.
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
