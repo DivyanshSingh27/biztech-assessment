@@ -42,7 +42,19 @@ Instead, the API enqueues a job and returns immediately. Celery workers process 
 - More custom code means more failure cases to investigate and maintain, which conflicts with the instruction not to over-engineer.
 ## 3. Decision
 I chose Celery with Redis. It gives retries with exponential backoff (`autoretry_for`, `retry_backoff`) and crash safety (`acks_late`) out of the box, so I do not have to build and test them myself. Redis is both the broker and the shared store for the rate limiter. Neither Celery nor Django Q enforces a global 200/min limit, so I write that part myself with an atomic Redis operation, so concurrent workers cannot exceed the limit together. Jobs that exhaust their retries go to a separate dead-letter store.
+
 ## 4. Rate limiter
+### 4.1 Why a sliding window?
+I chose a sliding window over a token bucket because the requirement is a strict maximum of 200 emails in any rolling 60-second period. A token bucket with capacity 200 and a refill of 200 per minute can send 200 immediately and then roughly 200 more from refill within the same 60 seconds, so it can pass about 400 in a rolling minute. A fixed window (`INCR` + `EXPIRE`) is simpler, but can also allow almost 400 emails across a minute boundary, for example 200 at 12:00:59 and another 200 at 12:01:00. A sliding window checks the previous 60 seconds on every request, so it matches the required limit directly.
+
+Trade-off: it stores one sorted-set entry per allowed send (at most 200 here, which is small) and does more Redis work per request than a counter.
+
+### 4.2 Atomicity
+The limiter uses a Redis Lua script (`SLIDING_WINDOW_LUA`) that removes expired entries (`ZREMRANGEBYSCORE`), counts the rest (`ZCARD`) and records an allowed request (`ZADD`) as one atomic operation. Redis runs commands one at a time on its command-processing thread, so another worker cannot interleave its own check halfway through the script. For example, if Worker A and Worker B both see four entries under a limit of five, separate Python `ZCARD` and `ZADD` calls could let both through; the script lets the first through and rejects the second. The script reads time from Redis (`TIME`) so workers with different system clocks agree, and uses a unique member per request (`uuid4`) so two sends in the same millisecond are not collapsed into one entry. `PEXPIRE` only cleans up an idle key; it does not enforce the limit.
+
+### 4.3 Redis failure policy: fail closed
+I choose fail closed because exceeding the provider's limit could cause HTTP 429 responses or account restrictions. If Redis is unavailable, the email task must not send without rate-limit authorization. The limiter call raises `redis.exceptions.ConnectionError`, which the task treats as retryable so Celery tries again when Redis recovers. However, Redis is also the Celery broker, so during an outage new tasks may fail to enqueue and workers may be unable to fetch or acknowledge tasks. The API should return an error (HTTP 503) when enqueueing fails instead of pretending the email was accepted. Fail closed prevents unmetered sending, but it cannot guarantee that new jobs can be queued during a broker outage.
+
 ## 5. Reliability (retries, dead letters, worker crash)
 ## 6. Redis failure behaviour
 ## 7. Known limitations
