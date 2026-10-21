@@ -56,5 +56,26 @@ The limiter uses a Redis Lua script (`SLIDING_WINDOW_LUA`) that removes expired 
 I choose fail closed because exceeding the provider's limit could cause HTTP 429 responses or account restrictions. If Redis is unavailable, the email task must not send without rate-limit authorization. The limiter call raises `redis.exceptions.ConnectionError`, which the task treats as retryable so Celery tries again when Redis recovers. However, Redis is also the Celery broker, so during an outage new tasks may fail to enqueue and workers may be unable to fetch or acknowledge tasks. The API should return an error (HTTP 503) when enqueueing fails instead of pretending the email was accepted. Fail closed prevents unmetered sending, but it cannot guarantee that new jobs can be queued during a broker outage.
 
 ## 5. Reliability (retries, dead letters, worker crash)
+### 5.1 Provider retries
+If the provider raises `ProviderError`, the task increments `EmailJob.attempts` and stores the error in `last_error`. It retries with exponential backoff of `2 ** attempts` seconds, capped at 300 seconds, and stops after `MAX_PROVIDER_ATTEMPTS = 5`. Rate-limit denials do not increment this counter. Celery's own `max_retries` is `None` because Celery's counter only covers Redis outages (fail closed, retry after 5 seconds); provider failures are capped by `attempts`.
+
+### 5.2 Dead-letter handling
+After five provider failures the task sets `status=DEAD` and keeps `last_error`. I use the existing `EmailJob` row as the dead-letter record instead of a separate Redis queue: the status and error stay queryable (`EmailJob.objects.filter(status=DEAD)`, backed by the index on `status`) without another queue to operate. Requeueing a dead job after the cause is fixed is a manual step; I did not build tooling for it.
+
+### 5.3 Rate-limit denial
+When the limiter returns `allowed=False`, the task schedules a new message with `apply_async(countdown=...)` instead of blocking a worker with `time.sleep()`. It does not increment `attempts`, because the provider was not called and the email has not failed. Random jitter (0-5 seconds) spreads out jobs that were denied together. The new message is enqueued before the current task returns, so a crash in between can cause a duplicate message but not a lost job; the status check below absorbs the duplicate.
+
+### 5.4 Worker SIGKILL
+The task uses `acks_late=True`, so the broker message is acknowledged after the task finishes, not when it starts. Two cases:
+- Whole worker killed (`kill -9` on the main process): the message stays in Redis's `unacked` hash and is redelivered after `visibility_timeout`. I set it to 120 seconds instead of the 1-hour default, and it must stay above the longest countdown (about 65 seconds), otherwise Redis would redeliver countdown tasks that are merely waiting.
+- Only a pool child process lost (for example killed for memory) while the worker survives: `reject_on_worker_lost=True` makes Celery requeue the message instead of acknowledging it.
+
+`worker_prefetch_multiplier=1` limits how many unacknowledged messages a worker holds ahead of processing, so a killed worker blocks fewer jobs. On redelivery the task checks `EmailJob.status` and returns `skipped:SENT` if the email already went out.
+
+Verified manually: after `kill -9` the message stayed in the `unacked` hash, was redelivered after the visibility timeout, and the redelivered task returned `skipped:SENT` without sending again.
+
+### 5.5 Delivery guarantee
+This is at-least-once processing, not exactly-once delivery. If the provider accepts an email and the worker dies before `status=SENT` is saved, or a provider call outlives `visibility_timeout` and the message is redelivered while still running, the recipient can get a duplicate. The limiter slot is taken before the provider call, so a failed attempt also uses a slot; this errs on the safe side of the provider limit.
+
 ## 6. Redis failure behaviour
 ## 7. Known limitations
