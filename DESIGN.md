@@ -32,7 +32,16 @@ Instead, the API enqueues a job and returns immediately. Celery workers process 
 - Rate limiting still needs custom work: the documented retry settings do not enforce a global 200/min limit across workers. A shared rate limiter would still be needed, and any backoff mechanism would have to be verified against the selected Django Q2 version.
 - Maintenance: the original `django-q` project's development stalled, and Django Q2 is a separate fork. Its current maintenance, supported versions, security fixes and release activity should be checked before adopting it.
 ### 2.3 Custom implementation
+**Pros**
+- Full control over job storage, scheduling, rate limiting and retry behaviour.
+- Can be tailored to the exact requirements without adopting a complete task-processing framework.
+
+**Cons**
+- Crash safety is my job. A plain Redis `BRPOP` removes the job from the list, so a worker that dies right after popping loses it. A safe version needs `LMOVE` into a per-worker processing list plus a recovery process for stale entries.
+- I would also need to implement and test retries, backoff, dead-letter handling and monitoring.
+- More custom code means more failure cases to investigate and maintain, which conflicts with the instruction not to over-engineer.
 ## 3. Decision
+I chose Celery with Redis. It gives retries with exponential backoff (`autoretry_for`, `retry_backoff`) and crash safety (`acks_late`) out of the box, so I do not have to build and test them myself. Redis is both the broker and the shared store for the rate limiter. Neither Celery nor Django Q enforces a global 200/min limit, so I write that part myself with an atomic Redis operation, so concurrent workers cannot exceed the limit together. Jobs that exhaust their retries go to a separate dead-letter store.
 ## 4. Rate limiter
 ## 5. Reliability (retries, dead letters, worker crash)
 ## 6. Redis failure behaviour
