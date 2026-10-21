@@ -1,4 +1,6 @@
+import os
 import smtplib
+import time
 
 from django.core.mail import send_mail
 
@@ -9,6 +11,10 @@ class ProviderError(Exception):
 
 def send_via_provider(job):
     """Send one email through Django's configured EMAIL_BACKEND."""
+    # Demo only: simulate a slow provider so a worker can be killed mid-task.
+    delay = float(os.environ.get("DEMO_SEND_DELAY", "0"))
+    if delay:
+        time.sleep(delay)
     try:
         send_mail(
             subject=job.subject,
