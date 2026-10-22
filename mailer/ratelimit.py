@@ -26,10 +26,10 @@ redis.call('ZREMRANGEBYSCORE', key, '-inf', now_ms - window_ms)
 local count = redis.call('ZCARD', key)
 
 -- 3a. Room left: record this send and allow it.
-if count < limit then
+  if count < limit then
   redis.call('ZADD', key, now_ms, member_id)
   redis.call('PEXPIRE', key, window_ms)
-  return {1, 0}
+  return {1, 0, now_ms}
 end
 
 -- 3b. Full: tell the caller when the oldest entry leaves the window.
@@ -38,7 +38,7 @@ local retry_after_ms = tonumber(oldest[2]) + window_ms - now_ms
 if retry_after_ms < 1 then
   retry_after_ms = 1
 end
-return {0, retry_after_ms}
+return {0, retry_after_ms, now_ms}
 """
 
 
@@ -51,12 +51,12 @@ class SlidingWindowRateLimiter:
         self._script = client.register_script(SLIDING_WINDOW_LUA)
 
     def acquire(self):
-        """Try to take one slot. Returns (allowed, retry_after_ms)."""
-        allowed, retry_after_ms = self._script(
+        """Try to reserve a slot; return (allowed, retry_after_ms, reserved_at_ms)."""
+        allowed, retry_after_ms, reserved_at_ms = self._script(
             keys=[self.key],
             args=[self.limit, self.window_ms, uuid.uuid4().hex],
         )
-        return bool(allowed), int(retry_after_ms)
+        return bool(allowed), int(retry_after_ms), int(reserved_at_ms)
 
 
 def get_email_rate_limiter():

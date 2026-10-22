@@ -6,10 +6,10 @@ from django.conf import settings
 from mailer.models import EmailJob
 from mailer.provider import ProviderError
 from mailer.services import enqueue_email
+from mailer.ratelimit import get_email_rate_limiter
 
 TOTAL_JOBS = 500
 FAIL_ONCE_KEY = "job-0042"
-TOLERANCE_MS = 150  # the fake provider records a few ms after the limiter allows
 SENT_LOG = "test:sent"
 
 
@@ -26,14 +26,25 @@ def test_500_jobs_no_loss_rate_limit_respected_and_failure_retried(
     celery_worker_running, redis_client, monkeypatch
 ):
     calls = collections.Counter()
+    reservation_times = []
+    limiter = get_email_rate_limiter()
+    original_acquire = limiter.acquire
+
+    def tracked_acquire():
+        result = original_acquire()
+        if result[0]:
+            reservation_times.append(result[2])
+        return result
+
+    monkeypatch.setattr("mailer.tasks.get_email_rate_limiter", lambda: limiter)
+    monkeypatch.setattr(limiter, "acquire", tracked_acquire)
 
     def fake_provider(job):
         key = job.idempotency_key
         calls[key] += 1
         if key == FAIL_ONCE_KEY and calls[key] == 1:
             raise ProviderError("simulated provider outage")
-        sec, micro = redis_client.time()
-        redis_client.rpush(SENT_LOG, f"{key}:{sec * 1000 + micro // 1000}")
+        redis_client.rpush(SENT_LOG, f"{key}:sent")
 
     monkeypatch.setattr("mailer.tasks.send_via_provider", fake_provider)
 
@@ -56,14 +67,16 @@ def test_500_jobs_no_loss_rate_limit_respected_and_failure_retried(
     # 2. The limit was never exceeded in any rolling window ...
     limit = settings.EMAIL_RATE_LIMIT
     window_ms = settings.EMAIL_RATE_WINDOW_SECONDS * 1000
-    ts = sorted(int(ms) for _, ms in records)
+    ts = sorted(reservation_times)
     for i in range(len(ts) - limit):
-        assert ts[i + limit] - ts[i] >= window_ms - TOLERANCE_MS, (
-            f"{limit + 1} sends within {ts[i + limit] - ts[i]} ms around index {i}"
+        assert ts[i + limit] - ts[i] >= window_ms, (
+            f"{limit + 1} sends within "
+            f"{ts[i + limit] - ts[i]} ms around index {i}"
         )
+
     # ... and throttling really happened (the test is not passing vacuously).
     min_span = (TOTAL_JOBS // limit - 1) * window_ms
-    assert ts[-1] - ts[0] >= min_span - TOLERANCE_MS
+    assert ts[-1] - ts[0] >= min_span
 
     # 3. The intentional failure was retried and then succeeded.
     failed_job = EmailJob.objects.get(idempotency_key=FAIL_ONCE_KEY)

@@ -31,7 +31,7 @@ def send_email_task(self, job_id):
 
     # 1. Ask the shared limiter. Fail closed if Redis is unavailable.
     try:
-        allowed, retry_after_ms = get_email_rate_limiter().acquire()
+        allowed, retry_after_ms, _reserved_at_ms = get_email_rate_limiter().acquire()
     except RedisError as exc:
         raise self.retry(exc=exc, countdown=REDIS_RETRY_SECONDS)
 
